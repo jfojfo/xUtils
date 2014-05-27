@@ -6,6 +6,7 @@ import com.lidroid.xutils.DbUtils;
 import com.lidroid.xutils.HttpUtils;
 import com.lidroid.xutils.db.converter.ColumnConverter;
 import com.lidroid.xutils.db.converter.ColumnConverterFactory;
+import com.lidroid.xutils.db.sqlite.ColumnDbType;
 import com.lidroid.xutils.db.sqlite.Selector;
 import com.lidroid.xutils.exception.DbException;
 import com.lidroid.xutils.exception.HttpException;
@@ -98,8 +99,8 @@ public class DownloadManager {
 
     public void removeDownload(DownloadInfo downloadInfo) throws DbException {
         HttpHandler<File> handler = downloadInfo.getHandler();
-        if (handler != null && !handler.isStopped()) {
-            handler.stop();
+        if (handler != null && !handler.isCancelled()) {
+            handler.cancel();
         }
         downloadInfoList.remove(downloadInfo);
         db.delete(downloadInfo);
@@ -112,10 +113,10 @@ public class DownloadManager {
 
     public void stopDownload(DownloadInfo downloadInfo) throws DbException {
         HttpHandler<File> handler = downloadInfo.getHandler();
-        if (handler != null && !handler.isStopped()) {
-            handler.stop();
+        if (handler != null && !handler.isCancelled()) {
+            handler.cancel();
         } else {
-            downloadInfo.setState(HttpHandler.State.STOPPED);
+            downloadInfo.setState(HttpHandler.State.CANCELLED);
         }
         db.saveOrUpdate(downloadInfo);
     }
@@ -123,10 +124,10 @@ public class DownloadManager {
     public void stopAllDownload() throws DbException {
         for (DownloadInfo downloadInfo : downloadInfoList) {
             HttpHandler<File> handler = downloadInfo.getHandler();
-            if (handler != null && !handler.isStopped()) {
-                handler.stop();
+            if (handler != null && !handler.isCancelled()) {
+                handler.cancel();
             } else {
-                downloadInfo.setState(HttpHandler.State.STOPPED);
+                downloadInfo.setState(HttpHandler.State.CANCELLED);
             }
         }
         db.saveOrUpdateAll(downloadInfoList);
@@ -196,7 +197,7 @@ public class DownloadManager {
         }
 
         @Override
-        public void onStopped() {
+        public void onCancelled() {
             HttpHandler<File> handler = downloadInfo.getHandler();
             if (handler != null) {
                 downloadInfo.setState(handler.getState());
@@ -207,7 +208,7 @@ public class DownloadManager {
                 LogUtils.e(e.getMessage(), e);
             }
             if (baseCallBack != null) {
-                baseCallBack.onStopped();
+                baseCallBack.onCancelled();
             }
         }
 
@@ -265,12 +266,12 @@ public class DownloadManager {
     private class HttpHandlerStateConverter implements ColumnConverter<HttpHandler.State> {
 
         @Override
-        public HttpHandler.State getFiledValue(Cursor cursor, int index) {
+        public HttpHandler.State getFieldValue(Cursor cursor, int index) {
             return HttpHandler.State.valueOf(cursor.getInt(index));
         }
 
         @Override
-        public HttpHandler.State getFiledValue(String fieldStringValue) {
+        public HttpHandler.State getFieldValue(String fieldStringValue) {
             if (fieldStringValue == null) return null;
             return HttpHandler.State.valueOf(fieldStringValue);
         }
@@ -281,8 +282,8 @@ public class DownloadManager {
         }
 
         @Override
-        public String getColumnDbType() {
-            return "INTEGER";
+        public ColumnDbType getColumnDbType() {
+            return ColumnDbType.INTEGER;
         }
     }
 }

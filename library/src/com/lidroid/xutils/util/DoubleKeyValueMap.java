@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-package com.lidroid.xutils.util.core;
+package com.lidroid.xutils.util;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -35,9 +35,16 @@ public class DoubleKeyValueMap<K1, K2, V> {
     }
 
     public void put(K1 key1, K2 key2, V value) {
+        if (key1 == null || key2 == null || value == null) return;
         if (k1_k2V_map.containsKey(key1)) {
             ConcurrentHashMap<K2, V> k2V_map = k1_k2V_map.get(key1);
-            k2V_map.put(key2, value);
+            if (k2V_map != null) {
+                k2V_map.put(key2, value);
+            } else {
+                k2V_map = new ConcurrentHashMap<K2, V>();
+                k2V_map.put(key2, value);
+                k1_k2V_map.put(key1, k2V_map);
+            }
         } else {
             ConcurrentHashMap<K2, V> k2V_map = new ConcurrentHashMap<K2, V>();
             k2V_map.put(key2, value);

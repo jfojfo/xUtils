@@ -74,16 +74,16 @@ public class FileBody extends AbstractContentBody {
         if (out == null) {
             throw new IllegalArgumentException("Output stream may not be null");
         }
-        InputStream in = null;
+        BufferedInputStream in = null;
         try {
-            in = new FileInputStream(this.file);
+            in = new BufferedInputStream(new FileInputStream(this.file));
             byte[] tmp = new byte[4096];
             int l;
             while ((l = in.read(tmp)) != -1) {
                 out.write(tmp, 0, l);
                 callBackInfo.pos += l;
                 if (!callBackInfo.doCallBack(false)) {
-                    throw new InterruptedIOException("stop");
+                    throw new InterruptedIOException("cancel");
                 }
             }
             out.flush();

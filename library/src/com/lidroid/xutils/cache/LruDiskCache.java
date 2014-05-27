@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-package com.lidroid.xutils.util.core;
+package com.lidroid.xutils.cache;
 
 import com.lidroid.xutils.util.IOUtils;
 import com.lidroid.xutils.util.LogUtils;
@@ -21,8 +21,6 @@ import org.apache.http.protocol.HTTP;
 
 import java.io.*;
 import java.nio.charset.Charset;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -31,8 +29,6 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * A cache that uses a bounded amount of space on a filesystem. Each cache
@@ -82,13 +78,13 @@ public final class LruDiskCache implements Closeable {
     static final String JOURNAL_FILE_TEMP = "journal.tmp";
     static final String JOURNAL_FILE_BACKUP = "journal.bkp";
     static final String MAGIC = "libcore.io.DiskLruCache";
-    static final String VERSION_1 = "1";
+    static final String VERSION = "1";
     static final long ANY_SEQUENCE_NUMBER = -1;
-    static final Pattern LEGAL_KEY_PATTERN = Pattern.compile("[a-z0-9_-]{1,64}");
-    private static final String CLEAN = "CLEAN";
-    private static final String DIRTY = "DIRTY";
-    private static final String REMOVE = "REMOVE";
-    private static final String READ = "READ";
+    private static final char CLEAN = 'C';
+    private static final char UPDATE = 'U';
+    private static final char DELETE = 'D';
+    private static final char READ = 'R';
+    private static final char EXPIRY_PREFIX = 't';
 
     /*
      * This cache uses a journal file named "journal". A typical journal file
@@ -99,10 +95,10 @@ public final class LruDiskCache implements Closeable {
      *     2
      *
      *     CLEAN 3400330d1dfc7f3f7f4b8d4d803dfcf6 832 21054
-     *     DIRTY 335c4c6028171cfddfbaae1a9c313c52
+     *     UPDATE 335c4c6028171cfddfbaae1a9c313c52
      *     CLEAN 335c4c6028171cfddfbaae1a9c313c52 3934 2342
-     *     REMOVE 335c4c6028171cfddfbaae1a9c313c52
-     *     DIRTY 1ab96a171faeeee38496d8b330771a7a
+     *     DELETE 335c4c6028171cfddfbaae1a9c313c52
+     *     UPDATE 1ab96a171faeeee38496d8b330771a7a
      *     CLEAN 1ab96a171faeeee38496d8b330771a7a 1600 234
      *     READ 335c4c6028171cfddfbaae1a9c313c52
      *     READ 3400330d1dfc7f3f7f4b8d4d803dfcf6
@@ -114,15 +110,15 @@ public final class LruDiskCache implements Closeable {
      * Each of the subsequent lines in the file is a record of the state of a
      * cache entry. Each line contains space-separated values: a state, a key,
      * and optional state-specific values.
-     *   o DIRTY lines track that an entry is actively being created or updated.
-     *     Every successful DIRTY action should be followed by a CLEAN or REMOVE
-     *     action. DIRTY lines without a matching CLEAN or REMOVE indicate that
+     *   o UPDATE lines track that an entry is actively being created or updated.
+     *     Every successful UPDATE action should be followed by a CLEAN or DELETE
+     *     action. UPDATE lines without a matching CLEAN or DELETE indicate that
      *     temporary files may need to be deleted.
      *   o CLEAN lines track a cache entry that has been successfully published
      *     and may be read. A publish line is followed by the lengths of each of
      *     its values.
      *   o READ lines track accesses for LRU.
-     *   o REMOVE lines track entries that have been deleted.
+     *   o DELETE lines track entries that have been deleted.
      *
      * The journal file is appended to as cache operations occur. The journal may
      * occasionally be compacted by dropping redundant lines. A temporary file named
@@ -231,9 +227,10 @@ public final class LruDiskCache implements Closeable {
         }
 
         // Create a new empty cache.
-        directory.mkdirs();
-        cache = new LruDiskCache(directory, appVersion, valueCount, maxSize);
-        cache.rebuildJournal();
+        if (directory.exists() || directory.mkdirs()) {
+            cache = new LruDiskCache(directory, appVersion, valueCount, maxSize);
+            cache.rebuildJournal();
+        }
         return cache;
     }
 
@@ -247,7 +244,7 @@ public final class LruDiskCache implements Closeable {
             String valueCountString = reader.readLine();
             String blank = reader.readLine();
             if (!MAGIC.equals(magic)
-                    || !VERSION_1.equals(version)
+                    || !VERSION.equals(version)
                     || !Integer.toString(appVersion).equals(appVersionString)
                     || !Integer.toString(valueCount).equals(valueCountString)
                     || !"".equals(blank)) {
@@ -272,7 +269,10 @@ public final class LruDiskCache implements Closeable {
 
     private void readJournalLine(String line) throws IOException {
         int firstSpace = line.indexOf(' ');
-        if (firstSpace == -1) {
+        char lineTag = 0;
+        if (firstSpace == 1) {
+            lineTag = line.charAt(0);
+        } else {
             throw new IOException("unexpected journal line: " + line);
         }
 
@@ -281,7 +281,7 @@ public final class LruDiskCache implements Closeable {
         final String diskKey;
         if (secondSpace == -1) {
             diskKey = line.substring(keyBegin);
-            if (firstSpace == REMOVE.length() && line.startsWith(REMOVE)) {
+            if (lineTag == DELETE) {
                 lruEntries.remove(diskKey);
                 return;
             }
@@ -295,29 +295,37 @@ public final class LruDiskCache implements Closeable {
             lruEntries.put(diskKey, entry);
         }
 
-        if (secondSpace != -1 && firstSpace == CLEAN.length() && line.startsWith(CLEAN)) {
-            entry.readable = true;
-            entry.currentEditor = null;
-            String[] parts = line.substring(secondSpace + 1).split(" ");
-            if (parts.length > 0) {
-                try {
-                    if (parts[0].startsWith("t_")) {
-                        entry.expiryTimestamp = Long.valueOf(parts[0].substring(2));
-                        entry.setLengths(parts, 1);
-                    } else {
-                        entry.expiryTimestamp = Long.MAX_VALUE;
-                        entry.setLengths(parts, 0);
+        switch (lineTag) {
+            case CLEAN: {
+                entry.readable = true;
+                entry.currentEditor = null;
+                String[] parts = line.substring(secondSpace + 1).split(" ");
+                if (parts.length > 0) {
+                    try {
+                        if (parts[0].charAt(0) == EXPIRY_PREFIX) {
+                            entry.expiryTimestamp = Long.valueOf(parts[0].substring(1));
+                            entry.setLengths(parts, 1);
+                        } else {
+                            entry.expiryTimestamp = Long.MAX_VALUE;
+                            entry.setLengths(parts, 0);
+                        }
+                    } catch (Throwable e) {
+                        throw new IOException("unexpected journal line: " + line);
                     }
-                } catch (Throwable e) {
-                    throw new IOException("unexpected journal line: " + line);
                 }
+                break;
             }
-        } else if (secondSpace == -1 && firstSpace == DIRTY.length() && line.startsWith(DIRTY)) {
-            entry.currentEditor = new Editor(entry);
-        } else if (secondSpace == -1 && firstSpace == READ.length() && line.startsWith(READ)) {
-            // This work was already done by calling lruEntries.get().
-        } else {
-            throw new IOException("unexpected journal line: " + line);
+            case UPDATE: {
+                entry.currentEditor = new Editor(entry);
+                break;
+            }
+            case READ: {
+                // This work was already done by calling lruEntries.get().
+                break;
+            }
+            default: {
+                throw new IOException("unexpected journal line: " + line);
+            }
         }
     }
 
@@ -359,7 +367,7 @@ public final class LruDiskCache implements Closeable {
                     new OutputStreamWriter(new FileOutputStream(journalFileTmp), HTTP.US_ASCII));
             writer.write(MAGIC);
             writer.write("\n");
-            writer.write(VERSION_1);
+            writer.write(VERSION);
             writer.write("\n");
             writer.write(Integer.toString(appVersion));
             writer.write("\n");
@@ -369,9 +377,9 @@ public final class LruDiskCache implements Closeable {
 
             for (Entry entry : lruEntries.values()) {
                 if (entry.currentEditor != null) {
-                    writer.write(DIRTY + ' ' + entry.diskKey + '\n');
+                    writer.write(UPDATE + " " + entry.diskKey + '\n');
                 } else {
-                    writer.write(CLEAN + ' ' + entry.diskKey + " t_" + entry.expiryTimestamp + entry.getLengths() + '\n');
+                    writer.write(CLEAN + " " + entry.diskKey + " " + EXPIRY_PREFIX + entry.expiryTimestamp + entry.getLengths() + '\n');
                 }
             }
         } finally {
@@ -404,9 +412,8 @@ public final class LruDiskCache implements Closeable {
     }
 
     public synchronized long getExpiryTimestamp(String key) throws IOException {
-        String diskKey = diskCacheFileNameGenerator.generate(key);
+        String diskKey = fileNameGenerator.generate(key);
         checkNotClosed();
-        validateKey(diskKey);
         Entry entry = lruEntries.get(diskKey);
         if (entry == null) {
             return 0;
@@ -416,12 +423,12 @@ public final class LruDiskCache implements Closeable {
     }
 
     public File getCacheFile(String key, int index) {
-        String diskKey = diskCacheFileNameGenerator.generate(key);
+        String diskKey = fileNameGenerator.generate(key);
         return new File(this.directory, diskKey + "." + index);
     }
 
     public Snapshot get(String key) throws IOException {
-        String diskKey = diskCacheFileNameGenerator.generate(key);
+        String diskKey = fileNameGenerator.generate(key);
         return getByDiskKey(diskKey);
     }
 
@@ -432,7 +439,6 @@ public final class LruDiskCache implements Closeable {
      */
     private synchronized Snapshot getByDiskKey(String diskKey) throws IOException {
         checkNotClosed();
-        validateKey(diskKey);
         Entry entry = lruEntries.get(diskKey);
         if (entry == null) {
             return null;
@@ -453,7 +459,7 @@ public final class LruDiskCache implements Closeable {
                 entry.lengths[i] = 0;
             }
             redundantOpCount++;
-            journalWriter.append(REMOVE + ' ' + diskKey + '\n');
+            journalWriter.append(DELETE + " " + diskKey + '\n');
             lruEntries.remove(diskKey);
             if (journalRebuildRequired()) {
                 executorService.submit(cleanupCallable);
@@ -482,7 +488,7 @@ public final class LruDiskCache implements Closeable {
         }
 
         redundantOpCount++;
-        journalWriter.append(READ + ' ' + diskKey + '\n');
+        journalWriter.append(READ + " " + diskKey + '\n');
         if (journalRebuildRequired()) {
             executorService.submit(cleanupCallable);
         }
@@ -495,13 +501,12 @@ public final class LruDiskCache implements Closeable {
      * edit is in progress.
      */
     public Editor edit(String key) throws IOException {
-        String diskKey = diskCacheFileNameGenerator.generate(key);
+        String diskKey = fileNameGenerator.generate(key);
         return editByDiskKey(diskKey, ANY_SEQUENCE_NUMBER);
     }
 
     private synchronized Editor editByDiskKey(String diskKey, long expectedSequenceNumber) throws IOException {
         checkNotClosed();
-        validateKey(diskKey);
         Entry entry = lruEntries.get(diskKey);
         if (expectedSequenceNumber != ANY_SEQUENCE_NUMBER &&
                 (entry == null || entry.sequenceNumber != expectedSequenceNumber)) {
@@ -518,7 +523,7 @@ public final class LruDiskCache implements Closeable {
         entry.currentEditor = editor;
 
         // Flush the journal before creating files to prevent file leaks.
-        journalWriter.write(DIRTY + ' ' + diskKey + '\n');
+        journalWriter.write(UPDATE + " " + diskKey + '\n');
         journalWriter.flush();
         return editor;
     }
@@ -596,13 +601,13 @@ public final class LruDiskCache implements Closeable {
         entry.currentEditor = null;
         if (entry.readable | success) {
             entry.readable = true;
-            journalWriter.write(CLEAN + ' ' + entry.diskKey + " t_" + entry.expiryTimestamp + entry.getLengths() + '\n');
+            journalWriter.write(CLEAN + " " + entry.diskKey + " " + EXPIRY_PREFIX + entry.expiryTimestamp + entry.getLengths() + '\n');
             if (success) {
                 entry.sequenceNumber = nextSequenceNumber++;
             }
         } else {
             lruEntries.remove(entry.diskKey);
-            journalWriter.write(REMOVE + ' ' + entry.diskKey + '\n');
+            journalWriter.write(DELETE + " " + entry.diskKey + '\n');
         }
         journalWriter.flush();
 
@@ -622,7 +627,7 @@ public final class LruDiskCache implements Closeable {
     }
 
     public boolean remove(String key) throws IOException {
-        String diskKey = diskCacheFileNameGenerator.generate(key);
+        String diskKey = fileNameGenerator.generate(key);
         return removeByDiskKey(diskKey);
     }
 
@@ -634,7 +639,6 @@ public final class LruDiskCache implements Closeable {
      */
     private synchronized boolean removeByDiskKey(String diskKey) throws IOException {
         checkNotClosed();
-        validateKey(diskKey);
         Entry entry = lruEntries.get(diskKey);
         if (entry == null || entry.currentEditor != null) {
             return false;
@@ -650,7 +654,7 @@ public final class LruDiskCache implements Closeable {
         }
 
         redundantOpCount++;
-        journalWriter.append(REMOVE + ' ' + diskKey + '\n');
+        journalWriter.append(DELETE + " " + diskKey + '\n');
         lruEntries.remove(diskKey);
 
         if (journalRebuildRequired()) {
@@ -715,13 +719,6 @@ public final class LruDiskCache implements Closeable {
     public void delete() throws IOException {
         IOUtils.closeQuietly(this);
         deleteContents(directory);
-    }
-
-    private void validateKey(String diskKey) {
-        Matcher matcher = LEGAL_KEY_PATTERN.matcher(diskKey);
-        if (!matcher.matches()) {
-            throw new IllegalArgumentException("keys must match regex [a-z0-9_-]{1,64}: \"" + diskKey + "\"");
-        }
     }
 
     private static String inputStreamToString(InputStream in) throws IOException {
@@ -990,7 +987,7 @@ public final class LruDiskCache implements Closeable {
         public String getLengths() throws IOException {
             StringBuilder result = new StringBuilder();
             for (long size : lengths) {
-                result.append(' ').append(size);
+                result.append(" ").append(size);
             }
             return result.toString();
         }
@@ -1204,49 +1201,15 @@ public final class LruDiskCache implements Closeable {
         }
     }
 
-    /////////////////////////////////////// DiskCacheFileNameGenerator ////////////////////////////////////////
-    public interface DiskCacheFileNameGenerator {
-        public String generate(String key);
+    private FileNameGenerator fileNameGenerator = new MD5FileNameGenerator();
+
+    public FileNameGenerator getFileNameGenerator() {
+        return fileNameGenerator;
     }
 
-    public class MD5DiskCacheFileNameGenerator implements DiskCacheFileNameGenerator {
-        public MD5DiskCacheFileNameGenerator() {
-        }
-
-        public String generate(String key) {
-            String cacheKey;
-            try {
-                final MessageDigest mDigest = MessageDigest.getInstance("MD5");
-                mDigest.update(key.getBytes());
-                cacheKey = bytesToHexString(mDigest.digest());
-            } catch (NoSuchAlgorithmException e) {
-                cacheKey = String.valueOf(key.hashCode());
-            }
-            return cacheKey;
-        }
-
-        private String bytesToHexString(byte[] bytes) {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < bytes.length; i++) {
-                String hex = Integer.toHexString(0xFF & bytes[i]);
-                if (hex.length() == 1) {
-                    sb.append('0');
-                }
-                sb.append(hex);
-            }
-            return sb.toString();
-        }
-    }
-
-    private DiskCacheFileNameGenerator diskCacheFileNameGenerator = new MD5DiskCacheFileNameGenerator();
-
-    public DiskCacheFileNameGenerator getDiskCacheFileNameGenerator() {
-        return diskCacheFileNameGenerator;
-    }
-
-    public void setDiskCacheFileNameGenerator(DiskCacheFileNameGenerator diskCacheFileNameGenerator) {
-        if (diskCacheFileNameGenerator != null) {
-            this.diskCacheFileNameGenerator = diskCacheFileNameGenerator;
+    public void setFileNameGenerator(FileNameGenerator fileNameGenerator) {
+        if (fileNameGenerator != null) {
+            this.fileNameGenerator = fileNameGenerator;
         }
     }
 }
